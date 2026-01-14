@@ -1,0 +1,48 @@
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 备份文件
+*.bak
+*.backup
+
+# 配置文件中的敏感信息
+config/odoo.conf
+config/postgresql.conf
+config/redis.conf
+
+# Docker 数据目录
+data/
+pgdata/
+redis/
+addons/
+
+# SSL 证书
+*.key
+*.crt
+*.pem
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Kiro 配置文件（本地环境配置，不提交到仓库）
+.kiro/
+
+# 测试文件
+test_*
+*_test.sh
+
+# 不发布到GitHub的文件
+PROJECT_SUMMARY.md
+test-deployment.sh
+verify-config.sh
