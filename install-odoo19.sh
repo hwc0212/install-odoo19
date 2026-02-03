@@ -50,10 +50,28 @@ check_system() {
     fi
     
     . /etc/os-release
-    if [[ "$ID" != "ubuntu" ]] || [[ "$VERSION_ID" != "24.04" ]]; then
-        log_error "此脚本仅支持 Ubuntu 24.04 LTS"
+    
+    # WSL环境检测
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        log_warn "检测到WSL环境"
+        IS_WSL=true
+    else
+        IS_WSL=false
+    fi
+    
+    if [[ "$ID" != "ubuntu" ]]; then
+        log_error "此脚本仅支持 Ubuntu 系统"
         log_info "当前系统: $PRETTY_NAME"
         exit 1
+    fi
+    
+    if [[ "$VERSION_ID" != "24.04" ]] && [[ "$VERSION_ID" != "22.04" ]] && [[ "$VERSION_ID" != "20.04" ]]; then
+        log_warn "推荐使用 Ubuntu 24.04 LTS，当前版本: $VERSION_ID"
+        read -p "是否继续? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
     fi
     
     log_info "系统检查通过: $PRETTY_NAME"
@@ -202,21 +220,39 @@ optimize_system() {
     
     # 安装必要软件
     log_info "安装必要软件..."
-    sudo apt install -y curl wget git ufw fail2ban build-essential \
-        libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libffi-dev \
-        libssl-dev nginx certbot python3-certbot-nginx htop
+    if [[ "$IS_WSL" == "true" ]]; then
+        # WSL环境不安装ufw和fail2ban
+        sudo apt install -y curl wget git build-essential \
+            libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libffi-dev \
+            libssl-dev nginx certbot python3-certbot-nginx htop
+    else
+        sudo apt install -y curl wget git ufw fail2ban build-essential \
+            libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libffi-dev \
+            libssl-dev nginx certbot python3-certbot-nginx htop
+    fi
     
     # 优化文件句柄限制
     log_info "优化系统参数..."
-    sudo tee -a /etc/security/limits.conf > /dev/null << EOF
+    
+    # 检查limits.conf是否已有配置，避免重复添加
+    if ! grep -q "# Odoo 优化参数" /etc/security/limits.conf 2>/dev/null; then
+        sudo tee -a /etc/security/limits.conf > /dev/null << EOF
+
+# Odoo 优化参数
 * soft nofile 65536
 * hard nofile 65536
 * soft nproc 65536
 * hard nproc 65536
 EOF
+    fi
     
-    # 优化内核参数
-    sudo tee -a /etc/sysctl.conf > /dev/null << EOF
+    # WSL环境跳过内核参数优化
+    if [[ "$IS_WSL" == "true" ]]; then
+        log_warn "WSL环境，跳过内核参数优化（某些参数不支持）"
+    else
+        # 检查sysctl.conf是否已有配置，避免重复添加
+        if ! grep -q "# Odoo 优化参数" /etc/sysctl.conf 2>/dev/null; then
+            sudo tee -a /etc/sysctl.conf > /dev/null << EOF
 
 # Odoo 优化参数
 fs.file-max = 2097152
@@ -233,12 +269,20 @@ vm.swappiness = 10
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
 EOF
-    
-    sudo sysctl -p
+        fi
+        
+        sudo sysctl -p 2>/dev/null || log_warn "部分内核参数设置失败，继续..."
+    fi
 }
 # 配置防火墙
 setup_firewall() {
     log_step "配置防火墙"
+    
+    # WSL环境跳过防火墙配置
+    if [[ "$IS_WSL" == "true" ]]; then
+        log_warn "WSL环境，跳过防火墙配置（请在Windows防火墙中配置）"
+        return
+    fi
     
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
@@ -259,12 +303,31 @@ install_docker() {
     
     if command -v docker &> /dev/null; then
         log_info "Docker已安装，跳过..."
+        
+        # 检查Docker服务状态
+        if ! docker ps &> /dev/null; then
+            log_warn "Docker服务未运行，尝试启动..."
+            if [[ "$IS_WSL" == "true" ]]; then
+                sudo service docker start || log_error "Docker启动失败，请手动启动: sudo service docker start"
+            else
+                sudo systemctl start docker || log_error "Docker启动失败"
+            fi
+        fi
         return
     fi
     
     sudo apt install -y docker.io docker-compose
-    sudo systemctl enable docker
-    sudo systemctl start docker
+    
+    # WSL使用service，非WSL使用systemctl
+    if [[ "$IS_WSL" == "true" ]]; then
+        sudo service docker start
+        log_info "Docker服务已启动（WSL模式）"
+    else
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        log_info "Docker服务已启动"
+    fi
+    
     sudo usermod -aG docker $USER
     
     # 配置Docker daemon
@@ -279,7 +342,13 @@ install_docker() {
 }
 EOF
     
-    sudo systemctl restart docker
+    # 重启Docker
+    if [[ "$IS_WSL" == "true" ]]; then
+        sudo service docker restart
+    else
+        sudo systemctl restart docker
+    fi
+    
     log_info "Docker安装完成"
 }
 
@@ -289,6 +358,11 @@ create_directories() {
     
     sudo mkdir -p /opt/odoo/{data,addons,pgdata,redis,config}
     sudo chown -R $USER:$USER /opt/odoo
+    
+    # 创建Odoo需要的子目录（容器内odoo用户UID通常是101）
+    sudo mkdir -p /opt/odoo/data/{sessions,filestore,addons}
+    sudo chown -R 101:101 /opt/odoo/data
+    sudo chmod -R 755 /opt/odoo/data
     
     log_info "目录结构创建完成"
 }
@@ -312,7 +386,7 @@ data_dir = /var/lib/odoo
 
 # 安全配置
 proxy_mode = True
-list_db = False
+list_db = True
 admin_passwd = $ADMIN_PASSWORD
 
 # 性能配置
@@ -379,16 +453,18 @@ EOF
 
     # 生成docker-compose.yml
     cat > /opt/odoo/docker-compose.yml << EOF
-version: '3.8'
-
 services:
   odoo:
     image: odoo:19
     container_name: odoo
     restart: unless-stopped
+    user: root
     depends_on:
       - db
       - redis
+    ports:
+      - "127.0.0.1:8069:8069"
+      - "127.0.0.1:8072:8072"
     environment:
       - HOST=db
       - USER=odoo
@@ -485,15 +561,10 @@ server {
         return 200 "User-agent: *\\nDisallow: /\\n";
     }
 
-    # 禁止访问数据库管理界面
-    location ~* ^/web/database/(manager|selector) {
-        deny all;
-        return 403;
-    }
 
     location / {
-        # 阻止爬虫
-        if (\$http_user_agent ~* (bot|spider|crawler|scraper)) {
+        # 阻止恶意爬虫（更精确的匹配）
+        if (\$http_user_agent ~* (AhrefsBot|SemrushBot|MJ12bot|DotBot|BLEXBot)) {
             return 403;
         }
 
@@ -548,11 +619,6 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/$DEFAULT_DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
-    # 禁止访问数据库管理界面
-    location ~* ^/web/database/(manager|selector) {
-        deny all;
-        return 403;
-    }
 
     location / {
         proxy_pass http://localhost:8069;
@@ -621,6 +687,12 @@ generate_ssl_certificates() {
 setup_fail2ban() {
     log_step "配置Fail2Ban"
     
+    # WSL环境跳过Fail2Ban配置
+    if [[ "$IS_WSL" == "true" ]]; then
+        log_warn "WSL环境，跳过Fail2Ban配置"
+        return
+    fi
+    
     # Odoo过滤规则
     sudo tee /etc/fail2ban/filter.d/odoo.conf > /dev/null << 'EOF'
 [Definition]
@@ -640,8 +712,8 @@ bantime = 3600
 action = iptables[name=Odoo, port=http, protocol=tcp]
 EOF
 
-    sudo systemctl enable fail2ban
-    sudo systemctl restart fail2ban
+    sudo systemctl enable fail2ban 2>/dev/null || sudo service fail2ban enable
+    sudo systemctl restart fail2ban 2>/dev/null || sudo service fail2ban restart
     log_info "Fail2Ban配置完成"
 }
 
@@ -753,7 +825,11 @@ start_services() {
     fi
     
     # 启动Nginx
-    sudo nginx -t && sudo systemctl restart nginx
+    if [[ "$IS_WSL" == "true" ]]; then
+        sudo nginx -t && sudo service nginx restart
+    else
+        sudo nginx -t && sudo systemctl restart nginx
+    fi
     log_info "Nginx启动成功"
 }
 
@@ -829,7 +905,11 @@ show_deployment_info() {
     if [[ "$DEPLOY_TYPE" == "website" ]]; then
         echo "3. 申请 Let's Encrypt 证书:"
         echo "   sudo certbot --nginx -d $MAIN_DOMAIN -d $WWW_DOMAIN"
-        echo "4. 重启 Nginx: sudo systemctl reload nginx"
+        if [[ "$IS_WSL" == "true" ]]; then
+            echo "4. 重启 Nginx: sudo service nginx reload"
+        else
+            echo "4. 重启 Nginx: sudo systemctl reload nginx"
+        fi
     fi
     echo
     echo "自动化任务:"
